@@ -1,4 +1,5 @@
 AtRTD2 PTC Detection
+
 PTC detection is based on STOP codons presence upstream of a splicing junction (>50 nt rule). 
 
 1) Using the original AtRTD2_19April2016 fasta (.fa) and gtf (.gtf) files we generated an enriched FASTA with CDSs and Junctions.
