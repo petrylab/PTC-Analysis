@@ -4,7 +4,7 @@ PTC detection is based on STOP codons presence upstream of a splicing junction (
 
 We implemented a streamlined three-step pipeline in Python to perform the analyses.
 
-1) Using the original AtRTD2_19April2016 fasta (.fa) and gtf (.gtf) files we generated an enriched FASTA with CDSs and Junctions.
+1) Using the original AtRTD2_19April2016 fasta (.fa) and gtf (.gtf) files (available at https://ics.hutton.ac.uk/atRTD/) we generated an enriched FASTA with CDSs and Junctions.
 To generate a file containing CDS and Junctions information...
 
     Run add_junction.py
