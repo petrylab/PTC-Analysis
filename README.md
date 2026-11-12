@@ -40,17 +40,3 @@ python detect_ptcs.py step2.fa
 ```
 
 The results can be easily visualized and further analyzed by loading the `_gene_summary.tsv` table.
-
-## Figure 1 analysis (`figure1_analysis/`)
-
-Scripts, output tables and figures for the isoform/PTC analysis (panels A to D). The scripts read
-`AtRTD2_reannotated_CDS_transcript_summary.tsv` from the working directory (a copy is in `figure1_analysis/tables/`).
-
-| Script | What it does | Panel |
-|---|---|---|
-| `gene_ptc_status_pies.py` | Genes with 1 transcript vs genes with alternative isoforms, split into All PTC / All No_PTC / Mixed | A |
-| `gene_ptc_status_pies_2v3plus.py` | Same comparison for genes with 2 isoforms vs 3 or more | |
-| `conditional_probability_PTC.py` | Probability that the next isoform is PTC-containing given non-PTC isoforms already present, and the reverse | B |
-| `productive_fraction_vs_isoforms_graphs_dodged.py` | Fraction of non-PTC isoforms vs isoforms per gene, and total vs non-PTC isoforms per bin | C, D |
-
-`figure1_analysis/tables/` holds the numbers behind each plot, plus the per-gene table (`table_per_gene_isoform_ptc_status.csv`).
