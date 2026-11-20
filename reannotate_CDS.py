@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
 """
-correct_cds.py
---------------
-Corrects CDS start positions across isoforms of the same gene using a shared
-ATG motif strategy, then outputs an enriched FASTA with updated headers and
-a gene-level summary TSV.
+reannotate_CDS.py
+-----------------
+Gives every isoform of a gene the same START codon and re-scans the STOP codon
+from it. The AtRTD2 CDS end is never used; AtRTD2 is only used to identify the
+START (ATG) of the canonical isoform.
 
-Strategy:
-    For each gene that has AT LEAST ONE isoform with an annotated CDS:
-      1. Find the reference isoform (earliest annotated CDS start).
-      2. Extract a ~23 nt motif centred on its ATG.
-      3. For every isoform in that gene (including those with NO annotated CDS):
-           - Search for the motif in the isoform sequence.
-           - If found, use that ATG as the CDS start.
-           - Scan downstream in-frame for the first stop codon → CDS end.
+Strategy, for each gene with AT LEAST ONE isoform with an annotated CDS:
+  1. Canonical (reference) isoform: the isoform with the longest ORF, scanning in
+     frame from its own AtRTD2 START to the first stop codon.
+  2. The genomic position of its ATG is taken as the gene's START.
+  3. For every isoform of the gene (including those with NO annotated CDS):
+       - If the gene's START is contained in the isoform (and is an ATG in its
+         sequence), that ATG is used and the first in-frame stop codon gives
+         the CDS end.
+       - Otherwise (the isoform cannot use the gene's START, e.g. the start exon
+         is skipped), the isoform keeps its own AtRTD2 START and the stop codon
+         is re-scanned from it. Isoforms with no AtRTD2 START either get no CDS.
+Isoforms are matched by genomic position (exon structure from the GTF), not by
+sequence context, so a START is still found when splicing changes the sequence
+around it.
 
 Header changes per isoform:
-    - Had CDS, coords changed   →  CDS_original=X-Y  CDS=new  CDS_method=Corrected_sharedATG  GeneType=Coding
-    - Had CDS, coords unchanged →  CDS=X-Y  GeneType=Coding
-    - Had NO CDS, motif found   →  CDS=new  CDS_method=Assigned_sharedATG  GeneType=Coding
-    - Had NO CDS, motif absent  →  CDS=unknown  CDS_method=NotFound  GeneType=Coding
-    - Gene has no CDS at all    →  GeneType=NonCoding  (rest of header untouched)
+    - Had CDS, coords changed   ->  CDS_original=X-Y  CDS=new  CDS_method=Corrected_sharedATG
+                                    (or Corrected_ownSTART if it keeps its own START)  GeneType=Coding
+    - Had CDS, coords unchanged ->  CDS=X-Y  GeneType=Coding
+    - Had NO CDS, START found   ->  CDS=new  CDS_method=Assigned_sharedATG  GeneType=Coding
+    - No START / no stop found  ->  CDS=unknown  CDS_method=NotFound  GeneType=Coding
+    - Gene has no CDS at all    ->  GeneType=NonCoding  (rest of header untouched)
 
 Outputs:
-    <output>.fa               Corrected/enriched FASTA
+    <output>.fa               Reannotated FASTA
     <output>_gene_summary.tsv Gene-level summary with CDS stats and GeneType
 
 Usage:
-    python correct_cds.py <input.fa> [output.fa]
+    python reannotate_CDS.py <enriched.fa> <annotation.gtf> [output.fa]
 
 Example:
-    python correct_cds.py AtRTD2_19April2016_enriched.fa
-    python correct_cds.py AtRTD2_19April2016_enriched.fa AtRTD2_corrected_CDS.fa
+    python reannotate_CDS.py AtRTD2_19April2016_enriched.fa AtRTD2_19April2016.gtf
 """
 
 import sys
@@ -51,8 +57,6 @@ from Bio.SeqRecord import SeqRecord
 # ---------------------------------------------------------------------------
 
 STOP_CODONS      = {"TAA", "TAG", "TGA"}
-MOTIF_UPSTREAM   = 11   # nt upstream of ATG in context motif
-MOTIF_DOWNSTREAM = 12   # nt downstream of ATG in context motif
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +111,6 @@ def parse_header(record: SeqRecord) -> dict:
 # Motif and stop-codon helpers
 # ---------------------------------------------------------------------------
 
-def extract_motif(seq: str, cds_start_1: int) -> str:
-    atg_0 = cds_start_1 - 1
-    start = max(0, atg_0 - MOTIF_UPSTREAM)
-    end   = min(len(seq), atg_0 + 3 + MOTIF_DOWNSTREAM)
-    return seq[start:end].upper()
-
-
 def find_inframe_stop(seq: str, cds_start_1: int) -> Optional[int]:
     start_0 = cds_start_1 - 1
     for i in range(start_0, len(seq) - 2, 3):
@@ -122,18 +119,45 @@ def find_inframe_stop(seq: str, cds_start_1: int) -> Optional[int]:
     return None
 
 
-def apply_motif(seq: str, motif: str) -> Optional[Tuple[int, int]]:
-    idx = seq.upper().find(motif.upper())
-    if idx == -1:
+def load_exons(gtf_path: str) -> dict:
+    """transcript_id -> (strand, [(exon_start, exon_end, bases_before_exon), ...]) in transcript order."""
+    cols = ["chr", "source", "feature", "start", "end", "score", "strand", "frame", "attribute"]
+    gtf = pd.read_csv(gtf_path, sep="\t", header=None, comment="#", names=cols,
+                      dtype={"start": int, "end": int})
+    gtf = gtf[gtf["feature"] == "exon"].copy()
+    gtf["transcript_id"] = gtf["attribute"].str.extract(r'transcript_id "([^"]+)"')
+    exons = {}
+    for tid, g in gtf.groupby("transcript_id"):
+        strand = g["strand"].iloc[0]
+        g = g.sort_values("start", ascending=(strand != "-"))
+        lengths = (g["end"] - g["start"] + 1).values
+        before = [0] + list(lengths.cumsum()[:-1])
+        exons[tid] = (strand, list(zip(g["start"].values, g["end"].values, before)))
+    return exons
+
+
+def tx_to_genomic(exons: dict, tid: str, pos_1: int) -> Optional[int]:
+    """1-based transcript position -> genomic coordinate."""
+    if tid not in exons:
         return None
-    atg_in_motif = motif.upper().find("ATG")
-    if atg_in_motif == -1:
+    strand, exon_list = exons[tid]
+    for s, e, before in exon_list:
+        if before < pos_1 <= before + (e - s + 1):
+            offset = pos_1 - before - 1
+            return int(e - offset) if strand == "-" else int(s + offset)
+    return None
+
+
+def genomic_to_tx(exons: dict, tid: str, g_pos: int) -> Optional[int]:
+    """Genomic coordinate -> 1-based transcript position (None if not in an exon)."""
+    if tid not in exons:
         return None
-    start_1 = idx + atg_in_motif + 1
-    end_1   = find_inframe_stop(seq, start_1)
-    if end_1 is None:
-        return None
-    return start_1, end_1
+    strand, exon_list = exons[tid]
+    for s, e, before in exon_list:
+        if s <= g_pos <= e:
+            offset = (e - g_pos) if strand == "-" else (g_pos - s)
+            return int(before + offset + 1)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -162,10 +186,14 @@ def rewrite_header(record: SeqRecord, info: dict, result: dict,
     for token in tokens:
         if token.startswith("CDS="):
             cds_token_found = True
-            if method == "Corrected_sharedATG":
+            if method in ("Corrected_sharedATG", "Corrected_ownSTART"):
                 new_tokens.append(f"CDS_original={info['cds_start']}-{info['cds_end']}")
                 new_tokens.append(f"CDS={result['start']}-{result['end']}")
                 new_tokens.append(f"CDS_method={method}")
+            elif method == "NotFound":
+                new_tokens.append(f"CDS_original={info['cds_start']}-{info['cds_end']}")
+                new_tokens.append("CDS=unknown")
+                new_tokens.append("CDS_method=NotFound")
             else:
                 # unchanged or NoReferenceInGene — keep as-is
                 new_tokens.append(token)
@@ -206,6 +234,8 @@ def build_gene_summary(genes: dict, info_map: dict, result_map: dict,
                            if result_map.get(tid, {}).get("method") == "NotFound")
         n_unchanged  = sum(1 for tid in isoform_ids
                            if result_map.get(tid, {}).get("method") == "unchanged")
+        n_own_start  = sum(1 for tid in isoform_ids
+                           if result_map.get(tid, {}).get("method") == "Corrected_ownSTART")
 
         rows.append({
             "gene_id":                    gene_id,
@@ -214,6 +244,7 @@ def build_gene_summary(genes: dict, info_map: dict, result_map: dict,
             "n_isoforms_cds_annotated":   n_annotated,
             "n_isoforms_cds_assigned":    n_assigned,
             "n_isoforms_cds_corrected":   n_corrected,
+            "n_isoforms_cds_own_start":   n_own_start,
             "n_isoforms_cds_unchanged":   n_unchanged,
             "n_isoforms_cds_not_found":   n_not_found,
         })
@@ -227,7 +258,7 @@ def build_gene_summary(genes: dict, info_map: dict, result_map: dict,
 # Main pipeline
 # ---------------------------------------------------------------------------
 
-def run(fasta_in: str, fasta_out: str) -> None:
+def run(fasta_in: str, gtf_in: str, fasta_out: str) -> None:
 
     summary_out = os.path.splitext(fasta_out)[0] + "_gene_summary.tsv"
 
@@ -236,6 +267,8 @@ def run(fasta_in: str, fasta_out: str) -> None:
     seq_map  = {rec.id: str(rec.seq).upper() for rec in records}
     info_map = {rec.id: parse_header(rec) for rec in records}
     print(f"      {len(records):,} records loaded.")
+    print(f"      Loading exon structures: {gtf_in}")
+    exons = load_exons(gtf_in)
 
     # Group isoforms by gene
     genes: dict = defaultdict(list)
@@ -262,12 +295,13 @@ def run(fasta_in: str, fasta_out: str) -> None:
     # -----------------------------------------------------------------------
     # Per-gene correction / CDS assignment
     # -----------------------------------------------------------------------
-    print(f"[2/5] Correcting / assigning CDS via shared ATG motif...")
+    print(f"[2/5] Assigning the gene's START to every isoform and re-scanning STOP codons...")
 
     result_map: dict = {}
     n_corrected = 0
     n_assigned  = 0
     n_not_found = 0
+    n_own_start = 0
 
     for gene_id, isoform_ids in genes.items():
         if gene_type_map[gene_id] == "NonCoding":
@@ -275,48 +309,59 @@ def run(fasta_in: str, fasta_out: str) -> None:
                 result_map[tid] = {"method": "NoReferenceInGene"}
             continue
 
-        isoforms_with_cds = [
-            tid for tid in isoform_ids
-            if info_map[tid]["cds_start"] is not None
-        ]
-
-        ref_id = min(isoforms_with_cds, key=lambda tid: info_map[tid]["cds_start"])
-        motif  = extract_motif(seq_map[ref_id], info_map[ref_id]["cds_start"])
+        # Canonical isoform: longest ORF from its own AtRTD2 START (AtRTD2 CDS end is ignored)
+        best_len, ref_id = -1, None
+        for tid in isoform_ids:
+            cs = info_map[tid]["cds_start"]
+            if cs is None:
+                continue
+            end = find_inframe_stop(seq_map[tid], cs)
+            orf_len = (end - cs + 1) if end else 0
+            if orf_len > best_len:
+                best_len, ref_id = orf_len, tid
+        ref_atg_genomic = tx_to_genomic(exons, ref_id, info_map[ref_id]["cds_start"])
 
         for tid in isoform_ids:
             info    = info_map[tid]
             had_cds = info["cds_start"] is not None
-            coords  = apply_motif(seq_map[tid], motif)
+            seq     = seq_map[tid]
 
-            if coords is None:
-                if had_cds:
+            pos = genomic_to_tx(exons, tid, ref_atg_genomic) if ref_atg_genomic else None
+            if pos is not None and seq[pos - 1:pos + 2] == "ATG":
+                start, method_new = pos, "shared"
+            elif had_cds:
+                start, method_new = info["cds_start"], "own"
+            else:
+                result_map[tid] = {"method": "NotFound"}
+                n_not_found += 1
+                continue
+
+            end = find_inframe_stop(seq, start)
+            if end is None:
+                result_map[tid] = {"method": "NotFound"}
+                n_not_found += 1
+                continue
+
+            if had_cds:
+                if start == info["cds_start"] and end == info["cds_end"]:
                     result_map[tid] = {"method": "unchanged"}
                 else:
-                    result_map[tid] = {"method": "NotFound"}
-                    n_not_found += 1
-            else:
-                corr_start, corr_end = coords
-                if had_cds:
-                    if corr_start != info["cds_start"] or corr_end != info["cds_end"]:
-                        result_map[tid] = {
-                            "method": "Corrected_sharedATG",
-                            "start":  corr_start,
-                            "end":    corr_end,
-                        }
+                    result_map[tid] = {
+                        "method": "Corrected_sharedATG" if method_new == "shared" else "Corrected_ownSTART",
+                        "start": start, "end": end,
+                    }
+                    if method_new == "shared":
                         n_corrected += 1
                     else:
-                        result_map[tid] = {"method": "unchanged"}
-                else:
-                    result_map[tid] = {
-                        "method": "Assigned_sharedATG",
-                        "start":  corr_start,
-                        "end":    corr_end,
-                    }
-                    n_assigned += 1
+                        n_own_start += 1
+            else:
+                result_map[tid] = {"method": "Assigned_sharedATG", "start": start, "end": end}
+                n_assigned += 1
 
-    print(f"      CDS corrected (coords changed) : {n_corrected:,} isoforms")
-    print(f"      CDS assigned  (was missing)    : {n_assigned:,} isoforms")
-    print(f"      CDS not found (motif absent)   : {n_not_found:,} isoforms")
+    print(f"      CDS corrected, gene's START (coords changed) : {n_corrected:,} isoforms")
+    print(f"      CDS corrected, own START (gene's START absent): {n_own_start:,} isoforms")
+    print(f"      CDS assigned  (was missing)                   : {n_assigned:,} isoforms")
+    print(f"      No CDS (no START or no in-frame stop)         : {n_not_found:,} isoforms")
 
     # -----------------------------------------------------------------------
     # Build output FASTA
@@ -361,9 +406,10 @@ def default_output(fasta_in: str) -> str:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Correct/assign CDS via shared ATG motif, add GeneType flag, output corrected FASTA + gene summary."
+        description="Give all isoforms of a gene the same START (matched by genomic position), re-scan STOP codons, add GeneType flag, output reannotated FASTA + gene summary."
     )
-    parser.add_argument("fasta", help="Input enriched FASTA (from add_junctions.py)")
+    parser.add_argument("fasta", help="Input enriched FASTA (from add_junction.py)")
+    parser.add_argument("gtf", help="GTF annotation used for the FASTA (exon lines are used)")
     parser.add_argument("output", nargs="?",
                         help="Output FASTA (default: <input>_corrected_CDS.fa)")
     return parser.parse_args()
@@ -376,4 +422,8 @@ if __name__ == "__main__":
         print(f"Error: file not found: {args.fasta}")
         sys.exit(1)
 
-    run(args.fasta, args.output or default_output(args.fasta))
+    if not os.path.exists(args.gtf):
+        print(f"Error: file not found: {args.gtf}")
+        sys.exit(1)
+
+    run(args.fasta, args.gtf, args.output or default_output(args.fasta))
