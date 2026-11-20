@@ -1,6 +1,6 @@
 # AtRTD2 PTC Detection
 
-PTC detection is based on the presence of STOP codons upstream of a splicing junction (>50 nt rule).
+PTC detection is based on the presence of STOP codons upstream of the last exon-exon junction (>50 nt rule).
 
 We implemented a streamlined four-step pipeline in Python to perform the analyses.
 
